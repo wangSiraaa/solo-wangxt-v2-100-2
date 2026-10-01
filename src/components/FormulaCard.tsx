@@ -1,16 +1,27 @@
-// 单条公式卡片：输入、变量赋值、原式/替换式/结果三段展示、问题定位
+// 单条公式卡片：输入、变量赋值（按选中工况解析继承/覆盖）、原式/代入式/结果三段展示、
+// 问题定位、工况与修订号标注、旧计算快照。
 import { useMemo, useState } from "react";
-import type { Formula, VariableDef } from "../engine/types";
+import type { CalcSnapshot, Condition, FieldResolution, Formula } from "../engine/types";
 import { analyzeFormula } from "../engine/math";
 import MathInput from "./MathInput";
 import Tex from "./Tex";
 import VariableTable from "./VariableTable";
+import SnapshotHistory from "./SnapshotHistory";
 
 interface Props {
   formula: Formula;
   index: number;
+  condition: Condition | undefined;
+  conditionUsable: boolean;
+  defaultsRev: number;
+  fields: Record<string, FieldResolution>;
+  snapshots: CalcSnapshot[];
+  activeConditionId: string | null;
   onChange: (patch: Partial<Formula>) => void;
   onDelete: () => void;
+  onOverride: (name: string, patch: { value?: string; unit?: string }) => void;
+  onResetOverride: (name: string) => void;
+  onMakeOverride: (name: string) => void;
 }
 
 const STATUS_META = {
@@ -20,15 +31,27 @@ const STATUS_META = {
   empty: { label: "空公式", cls: "empty" },
 } as const;
 
-export default function FormulaCard({ formula, index, onChange, onDelete }: Props) {
+export default function FormulaCard(props: Props) {
+  const {
+    formula, index, condition, conditionUsable, defaultsRev, fields, snapshots,
+    activeConditionId, onChange, onDelete, onOverride, onResetOverride, onMakeOverride,
+  } = props;
   const [collapsed, setCollapsed] = useState(false);
+
+  // 量纲引擎拿到的是当前工况下解析后的实际变量（缺失保持空值 → 报未赋值，绝不为零）
+  const engineVars = useMemo(() => {
+    const out: Record<string, { value: string; unit: string }> = {};
+    for (const [k, f] of Object.entries(fields)) out[k] = { value: f.value, unit: f.unit };
+    return out;
+  }, [fields]);
+
   const result = useMemo(
-    () => analyzeFormula(formula.latex, formula.variables, formula.targetUnit),
-    [formula.latex, formula.variables, formula.targetUnit],
+    () => analyzeFormula(formula.latex, engineVars, formula.targetUnit),
+    [formula.latex, engineVars, formula.targetUnit],
   );
   const meta = STATUS_META[result.status];
 
-  const setVars = (variables: Record<string, VariableDef>) => onChange({ variables });
+  const unitErrorCount = Object.values(fields).filter((f) => f.unitError).length;
 
   return (
     <section className={`card status-${meta.cls}`}>
@@ -39,6 +62,12 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
         <strong>公式 {index + 1}</strong>
         <span className={`badge ${meta.cls}`}>{meta.label}</span>
         <span className="summary">{result.summary}</span>
+        {condition && (
+          <span className="cond-context" title="本次计算使用的工况与版本">
+            {condition.name} · rev {condition.rev} · 默认层 rev {defaultsRev}
+            {!conditionUsable && "（已删除/不可用）"}
+          </span>
+        )}
         <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（不影响其他公式）">
           删除
         </button>
@@ -46,6 +75,26 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
 
       {!collapsed && (
         <div className="card-body">
+          {!conditionUsable && (
+            <div className="issue error" role="alert">
+              <span className="dot error" />
+              <span className="issue-msg">
+                {condition
+                  ? `当前工况“${condition.name}”已删除：本公式不会回退为零值，也不会借用其他工况的数据。请恢复该工况或切换到其他工况后再计算。`
+                  : "当前没有可用工况：变量不会取零。请新建或选择一套工况。"}
+              </span>
+            </div>
+          )}
+          {unitErrorCount > 0 && (
+            <div className="issue warning">
+              <span className="dot warning" />
+              <span className="issue-msg">
+                有 {unitErrorCount} 个覆盖字段的单位与公共默认为不同量纲（见下方变量表红色说明）；
+                覆盖值保持原样、未被静默改动，但结果量纲可能不正确。
+              </span>
+            </div>
+          )}
+
           <label className="field-label">
             输入表达式（支持 + − × ÷、幂、分数、括号；变量用字母或下标，如 <code>v</code>、<code>x_1</code>、<code>θ</code>）
             <MathInput
@@ -57,8 +106,23 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
 
           <div className="grid-2">
             <div>
-              <div className="field-label">变量赋值</div>
-              <VariableTable names={result.variables} value={formula.variables} onChange={setVars} />
+              <div className="field-label">
+                变量赋值（工况：{condition?.name ?? "—"}）
+                <span className="src-legend">
+                  <em className="src-badge src-override">覆盖</em>
+                  <em className="src-badge src-default">继承默认</em>
+                  <em className="src-badge src-legacy">旧版遗留</em>
+                  <em className="src-badge src-missing">未赋值</em>
+                </span>
+              </div>
+              <VariableTable
+                names={result.variables}
+                fields={fields}
+                editable={conditionUsable}
+                onOverride={onOverride}
+                onReset={onResetOverride}
+                onMakeOverride={onMakeOverride}
+              />
             </div>
             <div>
               <label className="field-label">
@@ -143,6 +207,8 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
               ))}
             </ul>
           )}
+
+          <SnapshotHistory snapshots={snapshots} currentConditionId={activeConditionId} />
         </div>
       )}
     </section>

@@ -9,7 +9,7 @@ function check(name, cond, detail = "") {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
 }
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const page = await browser.newPage();
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(String(e)));
@@ -80,8 +80,8 @@ check("除零：有错误", c5.badge === "有错误", c5.badge);
 check("除零：报除数为零", c5.issues.some((t) => t.includes("除数为零")), c5.issues[0] ?? "");
 check("除零：不显示结果数值", !/=\s*\d/.test(c5.resultText), c5.resultText);
 
-// 6) 隔离：删除量纲错误卡片后，其余 4 张状态不变
-await page.getByRole("button", { name: "删除" }).nth(3).click();
+// 6) 隔离：删除量纲错误卡片后，其余 4 张状态不变（删除按钮限定在卡片内，避开工况工具栏）
+await cards.nth(3).getByRole("button", { name: "删除" }).click();
 await page.waitForTimeout(300);
 check("删除后剩余 4 张", await cards.count() === 4);
 const b0 = (await cards.nth(0).locator(".badge").innerText()).trim();
