@@ -9,7 +9,9 @@
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "e2e": "node e2e/smoke.mjs",
+    "e2e:migration": "node e2e/migration.mjs"
   },
   "dependencies": {
     "katex": "^0.16.11",

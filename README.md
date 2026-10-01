@@ -1,23 +1,44 @@
 # 量纲检查笔记本（Dimension Notebook）
 
 面向工程教师的**本地**公式笔记工具：输入公式 → 给变量赋数值与单位 → 自动计算并检查常见量纲错误。
-无需服务器，数据只保存在浏览器 IndexedDB 中。
+同一套工程公式可在**参数工况集（常温 / 满载 / 故障…）**间切换：每套工况保存变量的**值、单位、覆盖关系与修订号**，
+公共默认变量更新只影响未覆盖字段；无需服务器，数据只保存在浏览器 IndexedDB 中。
 
 - **React 18 + TypeScript** 组织界面与文档
 - **MathLive** 提供所见即所得的数学输入（`+ − × ÷`、幂、分数、括号、希腊字母/下标）
 - **KaTeX** 渲染原式与代入后的计算式（问题节点红/橙色高亮）
 - **mathjs** 负责表达式解析、单位量纲与常用单位换算
-- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式）
+- **IndexedDB v2** 自动保存：公式 / 工况（含修订历史）/ 公共默认变量 / 冻结计算快照 / 冲突 / 回收站
+- 多标签页**乐观锁（CAS）+ 字段级三方合并**，**JSON v1/v2 导入导出**（旧版自动迁移为可追溯默认工况）
 
 ## 启动
 
 ```bash
 npm install
-npm run dev       # 本地开发
-npm run build     # 类型检查 + 生产构建到 dist/
-npm test          # 36 个单元测试（引擎 + 导出导入）
-node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev）
+npm run dev              # 本地开发
+npm run build            # 类型检查 + 生产构建到 dist/
+npm test                 # 50 个单元测试（引擎 / 工况解析与合并 / 导出导入）
+node e2e/smoke.mjs       # 52 项真实浏览器端到端检查（需先 npm run dev）
+node e2e/migration.mjs   # 14 项 IndexedDB v1→v2 原地迁移检查（需先 npm run dev）
 ```
+
+## 参数工况集怎么工作
+
+变量逐字段分层取值，优先级为：
+
+1. **工况覆盖**（`scenario.variables[name].value/unit`）—— 只存在于当前工况；
+2. **公共默认变量**（`defaults.variables[name]`）—— 所有工况共享，更新它只影响未覆盖字段；
+3. **旧版公式自带值**（`formula.legacyVariables`）—— 由无工况概念的旧笔记迁移而来，优先保证旧公式按原值计算；
+4. **缺值** —— 引擎明确报“变量未赋值”，**绝不取零**。
+
+每个工况与公共默认文档都带 `rev` 修订号和完整修订历史；多标签页保存时采用乐观锁：
+
+- 库中修订号已前进 → 本次写入被**明确拒绝**（同一 IndexedDB 事务内校验，绝不静默覆盖对端的单位/数值）；
+- 双方改的是**不同字段** → 自动字段级合并后再保存；
+- 改了**同一字段且值不同** → 弹出冲突面板，展示「共同基线 / 本标签页 / 对端」三方值与修订号，逐字段二选一，双方历史都保留；
+- 对端删除了工况 → 拒绝写入，本地草稿存入冲突面板，可先从回收站恢复工况再合并。
+
+工况删除为**软删除（回收站）**，可恢复；历史计算**快照**永不随工况删除而改变，只标注“该工况已删除”。
 
 ## 首版明确支持的范围
 
@@ -38,26 +59,52 @@ node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev�
 6. **超出支持范围**：函数（sin、cos、sqrt…）、取模、阶乘、关系符、±、矩阵/对象等，标记“未验证”而不是强行计算。
 7. **公式隔离**：每条公式独立分析、独立持久化，一条公式的任何错误都不会影响其他公式。
 8. **三段展示**：原式 → 替换变量后的计算式 → 结果（含结果单位及可选的目标单位换算值）。导出的 JSON 同时保存 LaTeX（可编辑本体）与中缀表达式（便于备份查看）。
+9. **工况可追溯**：历史计算快照冻结三段展示，并记录当时的工况 id/名称/修订号、公共默认修订号与每个变量的来源（覆盖/继承/旧版自带/缺值）；刷新页面、删除或恢复工况后快照内容不变。
+
+## IndexedDB 结构（v2）
+
+| Store | keyPath | 内容 |
+| --- | --- | --- |
+| `formulas` | `id` | 公式（LaTeX、目标单位、旧版迁移保留的 `legacyVariables`） |
+| `scenarios` | `id` | 工况：名称、`rev`、覆盖表、修订历史、来源说明 |
+| `defaults` | 固定 `defaults` | 公共默认变量（含 `rev` 与修订历史） |
+| `snapshots` | `id` | 冻结计算记录（三段展示 + 工况/修订溯源 + 逐变量来源） |
+| `conflicts` | `id` | 多标签页被拒写入的冲突事件（base/local/remote 三方字段表） |
+| `trash` | `id` | 软删除工况（可恢复；恢复遇 id 冲突会拒绝，不覆盖新工况） |
+| `meta` | 固定 `meta` | 当前选中工况 |
+
+旧版 v1 库在首次打开时由升级事务原地迁移（旧 formulas 游标读完后重建，避免事务中止）；
+旧版 v1 JSON 导入则生成“默认工况（旧版导入）”+ 公共默认并集，每条公式保留 `legacyVariables`。
 
 ## 项目结构
 
 ```
 src/
   engine/
-    latex.ts        # MathLive LaTeX → mathjs 中缀表达式（含范围控制）
-    math.ts         # 解析/量纲检查/定位/求值/换算，输出结构化 Issue
-    units.ts        # 首版常用单位清单（输入提示）
-    types.ts        # Formula / AnalysisResult / Issue 类型
-    math.test.ts    # 引擎测试（摄氏、角度、除零、定位、隔离…）
+    latex.ts          # MathLive LaTeX → mathjs 中缀表达式（含范围控制）
+    math.ts           # 解析/量纲检查/定位/求值/换算，输出结构化 Issue
+    scenarios.ts      # 工况分层取值、量纲兼容、修订提交、字段级三方合并（纯逻辑）
+    units.ts          # 首版常用单位清单（输入提示）
+    types.ts          # Formula / Scenario / CalcSnapshot / ConflictEvent 等类型
+    *.test.ts         # 引擎 + 工况 + 导出导入测试（50）
   storage/
-    db.ts           # IndexedDB 封装
-    exchange.ts     # JSON 导出/导入
+    db.ts             # IndexedDB v2：CAS 事务、v1→v2 升级迁移、回收站
+    exchange.ts       # JSON v1/v2 导出导入（旧版迁移为可追溯默认工况）
+    snapshot.ts       # 冻结计算快照
+    id.ts             # 通用 id 与标签页标识
+  state/
+    useNotebook.ts    # 全局状态、跨标签页同步、CAS 保存/合并/冲突解决
   components/
-    MathInput.tsx   # MathLive math-field 封装
-    Tex.tsx         # KaTeX 渲染
-    VariableTable.tsx
-    FormulaCard.tsx # 单条公式：输入/赋值/三段展示/问题定位
-    UnitSuggestions.tsx
+    ScenarioBar.tsx   # 工况切换/新建/重命名/删除（显示修订号与来源）
+    DefaultsEditor.tsx# 公共默认变量编辑
+    VariableTable.tsx # 变量表：继承/覆盖/缺值标记，逐字段覆盖或恢复继承
+    ConflictPanel.tsx # 三方值冲突面板：逐字段选择，不静默覆盖
+    TrashPanel.tsx    # 工况回收站（恢复/彻底删除）
+    SnapshotList.tsx  # 冻结历史计算记录（工况与修订溯源）
+    FormulaCard.tsx   # 单条公式：当前工况下三段展示 + 存历史记录
+    MathInput.tsx Tex.tsx UnitSuggestions.tsx
   App.tsx  main.tsx  styles.css
-e2e/smoke.mjs       # Playwright 端到端冒烟
+e2e/
+  smoke.mjs           # 52 项端到端：示例 / 工况切换 / 公共默认联动 / 多标签页 / 快照 / 旧版导入
+  migration.mjs       # 14 项 IndexedDB v1→v2 原地迁移
 ```

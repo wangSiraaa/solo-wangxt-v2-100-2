@@ -1,7 +1,9 @@
-// 单条公式卡片：输入、变量赋值、原式/替换式/结果三段展示、问题定位
+// 单条公式卡片：在“当前选中工况”下解析变量 → 三段展示；可冻结计算快照（记录工况与修订号）
 import { useMemo, useState } from "react";
-import type { Formula, VariableDef } from "../engine/types";
+import type { CalcSnapshot, FieldKey, Formula, PublicDefaultsDoc, Scenario } from "../engine/types";
 import { analyzeFormula } from "../engine/math";
+import { resolveFormulaVars } from "../engine/scenarios";
+import { makeSnapshot } from "../storage/snapshot";
 import MathInput from "./MathInput";
 import Tex from "./Tex";
 import VariableTable from "./VariableTable";
@@ -9,8 +11,12 @@ import VariableTable from "./VariableTable";
 interface Props {
   formula: Formula;
   index: number;
+  scenario?: Scenario;
+  defaults: PublicDefaultsDoc;
   onChange: (patch: Partial<Formula>) => void;
   onDelete: () => void;
+  onOverride: (scenarioId: string, name: string, field: FieldKey, text: string) => void;
+  onSaveSnapshot: (s: CalcSnapshot) => void;
 }
 
 const STATUS_META = {
@@ -20,18 +26,30 @@ const STATUS_META = {
   empty: { label: "空公式", cls: "empty" },
 } as const;
 
-export default function FormulaCard({ formula, index, onChange, onDelete }: Props) {
+export default function FormulaCard({
+  formula, index, scenario, defaults, onChange, onDelete, onOverride, onSaveSnapshot,
+}: Props) {
   const [collapsed, setCollapsed] = useState(false);
+
+  // 先用一次最小分析拿到变量名，再做工况解析；最终用解析后的完整变量表计算
+  const varNames = useMemo(() => {
+    if (!formula.latex.trim()) return [];
+    return analyzeFormula(formula.latex, {}, "").variables;
+  }, [formula.latex]);
+
+  const { defs, resolved } = useMemo(
+    () => resolveFormulaVars(formula, varNames, scenario, defaults),
+    [formula, varNames, scenario, defaults],
+  );
+
   const result = useMemo(
-    () => analyzeFormula(formula.latex, formula.variables, formula.targetUnit),
-    [formula.latex, formula.variables, formula.targetUnit],
+    () => analyzeFormula(formula.latex, defs, formula.targetUnit),
+    [formula.latex, defs, formula.targetUnit],
   );
   const meta = STATUS_META[result.status];
 
-  const setVars = (variables: Record<string, VariableDef>) => onChange({ variables });
-
   return (
-    <section className={`card status-${meta.cls}`}>
+    <section className={`card status-${meta.cls}`} data-formula-id={formula.id} data-note={formula.note}>
       <header className="card-head">
         <button type="button" className="collapse-btn" onClick={() => setCollapsed((c) => !c)}>
           {collapsed ? "▸" : "▾"}
@@ -39,7 +57,21 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
         <strong>公式 {index + 1}</strong>
         <span className={`badge ${meta.cls}`}>{meta.label}</span>
         <span className="summary">{result.summary}</span>
-        <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（不影响其他公式）">
+        {scenario && (
+          <span className="card-scn" title="当前计算所用工况及其修订号">
+            {scenario.name} · r{scenario.rev}
+          </span>
+        )}
+        <button
+          type="button"
+          className="mini-btn"
+          title="把当前工况下的计算结果存为历史记录（冻结，记录工况与修订号）"
+          disabled={result.status === "empty" || !scenario}
+          onClick={() => onSaveSnapshot(makeSnapshot(formula, result.variables, scenario, defaults))}
+        >
+          ◷ 存为历史记录
+        </button>
+        <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（其历史快照仍保留）">
           删除
         </button>
       </header>
@@ -51,14 +83,31 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
             <MathInput
               value={formula.latex}
               onChange={(latex) => onChange({ latex })}
-              placeholder="例如  v \\cdot t + \\frac{1}{2} a t^2"
+              placeholder="例如  v \cdot t + \frac{1}{2} a t^2"
             />
           </label>
 
+          {formula.legacyOrigin && (
+            <p className="legacy-banner" title={formula.legacyOrigin}>
+              旧版公式：{formula.legacyOrigin}（与公共默认不一致的字段以“旧版自带”标注）
+            </p>
+          )}
+
           <div className="grid-2">
             <div>
-              <div className="field-label">变量赋值</div>
-              <VariableTable names={result.variables} value={formula.variables} onChange={setVars} />
+              <div className="field-label">
+                变量赋值（工况：{scenario ? scenario.name : "无"}）
+                <span className="muted small inline-hint">
+                  灰字 = 继承公共默认/旧版自带；深框 = 本工况覆盖；缺值会报错，绝不取零
+                </span>
+              </div>
+              <VariableTable
+                names={result.variables}
+                resolved={resolved}
+                scenarioId={scenario?.id}
+                onOverride={(n, f, t) => scenario && onOverride(scenario.id, n, f, t)}
+                onClearOverride={(n, f) => scenario && onOverride(scenario.id, n, f, "")}
+              />
             </div>
             <div>
               <label className="field-label">
@@ -152,7 +201,6 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
 function fmt(n: number | undefined): string {
   if (n === undefined) return "";
   if (!Number.isFinite(n)) return String(n);
-  // 截断浮点尾零，科学计数法用 TeX 指数
   const abs = Math.abs(n);
   if (abs !== 0 && (abs >= 1e7 || abs < 1e-4)) {
     const [m, e] = n.toExponential(6).split("e");
